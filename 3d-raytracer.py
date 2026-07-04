@@ -1,5 +1,6 @@
+import math
 import numpy as np
-from numba import njit, prange
+from numba import njit, prange, njit, float64
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button
 import time
@@ -102,7 +103,7 @@ def sample_equirectangular(direction, pano_array, width, height):
 
 
 @njit(cache=True, fastmath=True, inline='always')
-def checker(x, y, scale):
+def checker(x, y, scale, c0=0, c1=1):
     """2D square checkerboard pattern"""
     if scale<=0:
         return 1.0
@@ -110,13 +111,53 @@ def checker(x, y, scale):
     checkery = int(y / scale) % 2
     if x < 0: checkerx = 1 - checkerx
     if y < 0: checkery = 1 - checkery
-    return 0.0 if checkerx == checkery else 1.0
+    return c0 if checkerx == checkery else c1
 
 
 @njit(cache=True, fastmath=True, inline='always')
 def reflection(vector, normal):
     """Reflection about normal"""
     return vector - 2.0 * np.dot(vector, normal) * normal
+
+
+@njit(cache=True, fastmath=True, inline='always')
+def lambertian_reflection(vector, normal, roughness=0.1):
+    """
+    Scatters a vector based on a roughness parameter.
+    roughness = 0.0 -> Fully reflective (Specular)
+    roughness = 1.0 -> Fully scattered (Lambertian)
+    """
+    # 1. Calculate the perfect reflection vector
+    # (Note: Assumes incoming 'vector' points toward the surface)
+    reflect_dir = vector - 2.0 * np.dot(vector, normal) * normal
+
+    # 2. Generate a random point on a unit sphere (Lambertian target)
+    theta = 2.0 * np.pi * np.random.random()
+    phi = np.arccos(2.0 * np.random.random() - 1.0)
+    sin_phi = np.sin(phi)
+
+    random_on_sphere = np.array([
+        sin_phi * np.cos(theta),
+        sin_phi * np.sin(theta),
+        np.cos(phi)
+    ])
+
+    # 3. Choose the target based on roughness
+    # If roughness is 0, we use pure reflection.
+    # If roughness is 1, we offset the normal (pure Lambertian).
+    if roughness > 0.0:
+        # Interpolate the base direction between pure reflection and the normal
+        base_dir = (1.0 - roughness) * reflect_dir + roughness * normal
+        scatter_direction = base_dir + roughness * random_on_sphere
+    else:
+        scatter_direction = reflect_dir
+
+    # 4. Catch degenerate cases where the vector sums to zero
+    if np.dot(scatter_direction, scatter_direction) < 1e-16:
+        return normal
+
+    # 5. Normalize and return
+    return scatter_direction / np.linalg.norm(scatter_direction)
 
 
 @njit(cache=True, fastmath=True, inline='always')
@@ -137,22 +178,32 @@ def refraction(vector, normal, n1, n2):
 
 @njit(cache=True, fastmath=True, inline='always')
 def schlick_fresnel(cos_theta_i, n1, n2):
-    """Schlick approximation to Fresnel reflection and transmission"""
-    if cos_theta_i < 0.0:
-        cos_theta_i = 0.0
-    elif cos_theta_i > 1.0:
-        cos_theta_i = 1.0
+    """
+    Schlick approximation to Fresnel reflection and transmission.
+    """
+    # Clamp cosine to avoid floating-point errors
+    cos_i = max(0.0, min(1.0, cos_theta_i))
 
-    sin_theta_i = np.sqrt(1.0 - cos_theta_i * cos_theta_i)
-    sin_theta_t = (n1 / n2) * sin_theta_i
-
-    if sin_theta_t >= 1.0:
-        return 1.0
-
-    cos_theta_t = np.sqrt(1.0 - sin_theta_t * sin_theta_t)
+    # Compute base reflectance at normal incidence (R0)
     r0 = ((n1 - n2) / (n1 + n2)) ** 2
 
-    cos_theta = cos_theta_t if n1 > n2 else cos_theta_i
+    # Internal Reflection
+    if n1 > n2:
+        sin_theta_i = np.sqrt(1.0 - cos_i * cos_i)
+        sin_theta_t = (n1 / n2) * sin_theta_i
+
+        # Total Internal Reflection (TIR)
+        if sin_theta_t >= 1.0:
+            return 1.0
+
+        # Schlick cosine approximation
+        cos_t = np.sqrt(1.0 - sin_theta_t * sin_theta_t)
+        cos_theta = max(0.0, min(1.0, cos_t))
+    else:
+        # Rare -> Dense medium transition (Standard External Reflection)
+        cos_theta = cos_i
+
+    # Schlick power formula
     return r0 + (1.0 - r0) * ((1.0 - cos_theta) ** 5)
 
 
@@ -245,7 +296,7 @@ def trace_rays(origin, direction, intensity, max_depth, n1, n2, color,
         if depth > max_depth:
             continue
 
-        # sphere intersection
+        # Sphere intersection
         (sphere_hit_point, has_sphere, is_inside, is_directed_outward,
          sphere_normal, ni, nt) = ray_sphere_intersection(
             ray_origin, ray_direction,
@@ -253,7 +304,7 @@ def trace_rays(origin, direction, intensity, max_depth, n1, n2, color,
             n1, n2
         )
 
-        # plane intersection
+        # Plane intersection
         plane_hit_point, has_plane = ray_plane_intersection(
             ray_origin, ray_direction,
             background_center, background_normal
@@ -261,7 +312,6 @@ def trace_rays(origin, direction, intensity, max_depth, n1, n2, color,
 
         # distances along ray (squared)
         sphere_dist2 = 1e30
-        plane_dist2 = 1e30
 
         if has_sphere:
             dx = sphere_hit_point[0] - ray_origin[0]
@@ -275,13 +325,29 @@ def trace_rays(origin, direction, intensity, max_depth, n1, n2, color,
             dzp = plane_hit_point[2] - ray_origin[2]
             plane_dist2 = dxp*dxp + dyp*dyp + dzp*dzp
 
-        # If plane is closer, shade plane
-        if has_plane and (not has_sphere or plane_dist2 < sphere_dist2):
-            if checker_intensity > 0.0:
-                if -25.4 < plane_hit_point[0] < 25.4 and -25.4 < plane_hit_point[2] < 25.4:
-                    pattern = checker(plane_hit_point[0], plane_hit_point[2], checker_scale)
-                    result_color += ray_intensity * pattern * checker_intensity * color
-                    continue
+            # If plane is closer, shade plane
+            if has_plane and (not has_sphere or plane_dist2 < sphere_dist2):
+                if checker_intensity > 0.0:
+                    if -25.4 < plane_hit_point[0] < 25.4 and -25.4 < plane_hit_point[2] < 25.4:
+                        pattern = checker(plane_hit_point[0], plane_hit_point[2], checker_scale, c0=0.1, c1=1.0)
+                        result_color += ray_intensity * pattern * checker_intensity * color
+
+                        # Calculate angle relative to the surface normal
+                        cos_theta = -np.dot(ray_direction, background_normal)
+
+                        # Calculate reflection intensity from Schlick approximation
+                        fresnel_reflectance = schlick_fresnel(cos_theta, 1.0, 1.5)
+
+                        # Propagate reflection
+                        if fresnel_reflectance > 0.0 and stack_size < max_stack - 1:
+                            v_refl = reflection(ray_direction, background_normal)
+                            origins[stack_size] = plane_hit_point + background_normal * 1e-4
+                            directions[stack_size] = v_refl
+                            intensities[stack_size] = ray_intensity * max(pattern, 0.1) * fresnel_reflectance
+                            depths[stack_size] = depth + 1
+                            stack_size += 1
+
+                        continue
 
         # If sphere is closer, shade sphere
         if has_sphere and not (is_inside and is_directed_outward):
@@ -295,7 +361,7 @@ def trace_rays(origin, direction, intensity, max_depth, n1, n2, color,
             v_refr, has_refr = refraction(ray_direction, sphere_normal, ni, nt)
             v_refl = reflection(ray_direction, sphere_normal)
 
-            # refraction path
+            # Propagate refraction
             if has_refr and stack_size < max_stack - 1:
                 origins[stack_size] = sphere_hit_point
                 directions[stack_size] = v_refr
@@ -303,7 +369,7 @@ def trace_rays(origin, direction, intensity, max_depth, n1, n2, color,
                 depths[stack_size] = depth + 1
                 stack_size += 1
 
-            # reflection path
+            # Propagate reflection
             if stack_size < max_stack - 1:
                 origins[stack_size] = sphere_hit_point
                 directions[stack_size] = v_refl
